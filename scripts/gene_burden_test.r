@@ -18,6 +18,8 @@ option_list = list(
               help="data type (quant or binary)", metavar="char"),
     make_option(c("-o", "--out"), type="character", default="out.txt", 
               help="output file name [default = %default]", metavar="char"),
+    make_option(c("-s", "--spa"), type="logical", default=FALSE, 
+              help="use SPA test for binary traits [default = %default]", metavar="TRUE/FALSE"),
     make_option(c("-n", "--nfork"), type="integer", default=1, 
               help="number of forks for parallel [default = %default]", metavar='int')
 ); 
@@ -71,9 +73,9 @@ pheno <- pheno[keep, ]
 if (dtype == 'binary') {
     n_case <- pheno[y==1, .N]
     n_ctrl <- pheno[y==0, .N]
-    if (n_ctrl/n_case > 99) {
+    if (n_ctrl/n_case > 100) {
         set.seed(1993)
-        max_ctrl <- n_case * 99
+        max_ctrl <- n_case * 100
         keep <- c(pheno[y==1, eid], pheno[y==0, sample(eid, max_ctrl)])
         pheno <- pheno[keep, ]
     }
@@ -92,35 +94,89 @@ rownames(geno_keep) <- geno$Gene
 cl <- parallel::makeForkCluster(opt$nfork)
 doParallel::registerDoParallel(cl)
 
-# loop over genes
-res <- foreach(g=geno$Gene, .combine='rbind') %dopar% {
-    pheno[, x:=geno_keep[g, ]]
-    hom_ref_count = pheno[x==0, .N]
-    het_alt_count = pheno[x==1, .N]
-    hom_alt_count = pheno[x==2, .N]
-    
-    if (dtype == 'quant') {
-        fit <- speedlm.fit(y = pheno$y, X = as.matrix(pheno[, .SD, .SDcols=-c('y', 'eid')]))
+# Binary - SPA test
+if (dtype == 'binary' & opt$spa) {
+    library(SPAtest)
+    # split geno into chunks for parallel computing
+    x <- 1:nrow(geno_keep)
+    chunks <- split(x, cut(seq_along(x), opt$nfork, labels = FALSE))
+    res <- foreach(ix=1:opt$nfork, .combine='rbind') %dopar% {
+        tmp <- SPAtest::ScoreTest_SPA(genos = geno_keep[chunks[[ix]],], pheno = pheno$y,
+                                      cov = as.matrix(pheno[, .SD, .SDcols=-c('y', 'eid')]),
+                                      beta.out = TRUE, beta.Cutoff = 1e-5)
+        tmp <- as.data.table(tmp)
     }
-    
-    if (dtype == 'binary') {
-        fit <- glm(data = pheno[, -1], formula = y ~ ., family = 'binomial')
-    }
-    
-    coef_tb <- coef(summary(fit))
-    if ('x' %in% rownames(coef_tb)) {
-        ret <- c(g, coef_tb['x', ], hom_ref_count, het_alt_count, hom_alt_count)
-    } else {
-        ret <- c(g, rep(NA, 4), hom_ref_count, het_alt_count, hom_alt_count)
-    }
-    
-    ret
 }
 
-res = setDT(as.data.frame(res))
-if (dtype == 'binary') colnames(res) <- c('Gene', 'EST', 'SE', 'T', 'P', 'HOM_REF', 'HET_ALT', 'HOM_ALT')
-if (dtype == 'quant') colnames(res)  <- c('Gene', 'EST', 'SE', 'Z', 'P', 'HOM_REF', 'HET_ALT', 'HOM_ALT')
+# Binary - logistic regression
+if (dtype == 'binary' & !opt$spa) {
+    # loop over genes
+    res <- foreach(g=geno$Gene, .combine='rbind') %dopar% {
+        pheno[, x:=geno_keep[g, ]]
 
-fwrite(res, out, sep='\t')
+        fit <- speedglm.wfit(y = pheno$y, X = as.matrix(pheno[, .SD, .SDcols=-c('y', 'eid')]), family = binomial('logit'))
+
+        coef_tb <- coef(summary(fit))
+        if ('x' %in% rownames(coef_tb)) {
+            ret <- c(g, coef_tb['x', ])
+        } else {
+            ret <- c(g, rep(NA, 4))
+        }
+        ret
+    }
+}
+
+# Continous traits - linear regression
+if (dtype == 'quant') {
+    # loop over genes
+    res <- foreach(g=geno$Gene, .combine='rbind') %dopar% {
+        pheno[, x:=geno_keep[g, ]]
+
+        fit <- speedlm.fit(y = pheno$y, X = as.matrix(pheno[, .SD, .SDcols=-c('y', 'eid')]))
+
+        coef_tb <- coef(summary(fit))
+        if ('x' %in% rownames(coef_tb)) {
+            ret <- c(g, coef_tb['x', ])
+        } else {
+            ret <- c(g, rep(NA, 4))
+        }
+
+        ret
+    }
+}
 
 parallel::stopCluster(cl)
+
+
+# Prepare output tables
+res <- setDT(as.data.frame(res))
+if (dtype == 'binary' & opt$spa) {
+    colnames(res) <- c('P', 'P.NA', 'is.converge', 'beta', 'SEbeta')
+    res <- cbind(Gene=rownames(geno_keep), res)
+}
+if (dtype == 'binary' & !opt$spa) colnames(res) <- c('Gene', 'EST', 'SE', 'T', 'P')
+if (dtype == 'quant') colnames(res)  <- c('Gene', 'EST', 'SE', 'Z', 'P')
+
+# add allele counts
+if (dtype == 'binary') {
+    control_hom_ref_count <- rowSums(geno_keep[,pheno$y==0]==0)
+    control_het_alt_count <- rowSums(geno_keep[,pheno$y==0]==1)
+    control_hom_alt_count <- rowSums(geno_keep[,pheno$y==0]==2)
+    case_hom_ref_count <- rowSums(geno_keep[,pheno$y==1]==0)
+    case_het_alt_count <- rowSums(geno_keep[,pheno$y==1]==1)
+    case_hom_alt_count <- rowSums(geno_keep[,pheno$y==1]==2)
+    ac <- data.table(case_hom_ref_count, case_het_alt_count, case_hom_alt_count, control_hom_ref_count, control_het_alt_count, control_hom_alt_count)
+    colnames(ac) <- c('Case_HOM_REF', 'Case_HET_ALT', 'Case_HOM_ALT', 'Control_HOM_REF', 'Control_HET_ALT', 'Control_HOM_ALT')
+}
+
+if (dtype == 'quant') {
+    hom_ref_count <- rowSums(geno_keep==0)
+    het_alt_count <- rowSums(geno_keep==1)
+    hom_alt_count <- rowSums(geno_keep==2)
+    ac <- data.table(hom_ref_count, het_alt_count, hom_alt_count)
+    colnames(ac) <- c('HOM_REF', 'HET_ALT', 'HOM_ALT')
+}
+
+
+res <- cbind(res, ac)
+fwrite(res, out, sep='\t')
